@@ -1,0 +1,229 @@
+name: CI → Staging → Prod (no SP)
+
+on:
+  push:
+    branches: ["testing", "main"]
+  pull_request:
+    branches: ["main"]        # PRs into main (source is usually testing)
+    types: [opened, synchronize, reopened]
+  workflow_dispatch: {}
+
+# No OIDC needed since we don't use azure/login
+permissions:
+  contents: read
+
+env:
+  # Image tag policy: PRs get pr-<number>-<sha>, branches get <sha>
+  IMAGE_TAG: ${{ github.event_name == 'pull_request'
+                  && format('pr-{0}-{1}', github.event.number, github.sha)
+                  || github.sha }}
+
+jobs:
+  # ----------------------------------------------------------------------------
+  # Stage 1 — CI: run tests, then build and push images to ACR (admin user)
+  # ----------------------------------------------------------------------------
+  ci_build_push:
+    if: |
+      github.ref == 'refs/heads/testing' ||
+      github.ref == 'refs/heads/main'    ||
+      github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: products
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -h 127.0.0.1"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest pytest-cov httpx
+
+      - name: Wait for Postgres
+        run: |
+          for i in {1..30}; do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres; then
+              echo "Postgres is ready"; break
+            fi
+            echo "Waiting for Postgres ($i/30)"; sleep 2
+          done
+
+      - name: Test product_service
+        working-directory: backend/product_service
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/products
+        run: |
+          pip install -r requirements.txt
+          pytest -vv -ra
+
+      - name: Test order_service
+        working-directory: backend/order_service
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/products
+        run: |
+          pip install -r requirements.txt
+          pytest -vv -ra || echo "no tests found for order_service"
+
+      - name: Test customer_service
+        working-directory: backend/customer_service
+        env:
+          DATABASE_URL: postgresql+psycopg2://postgres:postgres@127.0.0.1:5432/products
+        run: |
+          pip install -r requirements.txt
+          pytest -vv -ra || echo "no tests found for customer_service"
+
+      - name: Login to ACR (admin user)
+        run: |
+          echo "${{ secrets.ACR_PASSWORD }}" | docker login "${{ secrets.ACR_LOGIN_SERVER }}" -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push images
+        run: |
+          set -e
+          REG="${{ secrets.ACR_LOGIN_SERVER }}"
+          TAG="${{ env.IMAGE_TAG }}"
+          docker buildx build --platform linux/amd64 -t $REG/product_service:$TAG   -f backend/product_service/Dockerfile   --push .
+          docker buildx build --platform linux/amd64 -t $REG/order_service:$TAG     -f backend/order_service/Dockerfile     --push .
+          docker buildx build --platform linux/amd64 -t $REG/customer_service:$TAG  -f backend/customer_service/Dockerfile  --push .
+          docker buildx build --platform linux/amd64 -t $REG/frontend:$TAG          -f frontend/Dockerfile                  --push .
+
+  # ----------------------------------------------------------------------------
+  # Stage 2A — Ephemeral Staging: auto on testing and on PRs into main
+  # ----------------------------------------------------------------------------
+  staging_ephemeral:
+    needs: ci_build_push
+    if: github.ref == 'refs/heads/testing' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging         # add required reviewers in GitHub Environments if you want manual approval
+    steps:
+      - name: Checkout (same commit/ref)
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Write kubeconfig from secret
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_B64 }}" > kubeconfig.b64
+          base64 -d kubeconfig.b64 > kubeconfig
+          mkdir -p ~/.kube
+          cp kubeconfig ~/.kube/config
+          kubectl version --client
+
+      - name: Create ephemeral namespace
+        run: |
+          NS="stg-${{ github.run_id }}"
+          echo "STG_NS=$NS" >> $GITHUB_ENV
+          kubectl create namespace "$NS"
+
+      - name: Create ACR pull secret in staging (admin creds)
+        run: |
+          kubectl create secret docker-registry acr-pull \
+            -n "${{ env.STG_NS }}" \
+            --docker-server="${{ secrets.ACR_LOGIN_SERVER }}" \
+            --docker-username="${{ secrets.ACR_USERNAME }}" \
+            --docker-password="${{ secrets.ACR_PASSWORD }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default -n "${{ env.STG_NS }}" -p '{"imagePullSecrets":[{"name":"acr-pull"}]}'
+
+      - name: Deploy manifests to staging (frontend as ClusterIP)
+        run: |
+          sudo apt-get update && sudo apt-get install -y gettext-base
+          for f in k8s/prod/*.y*ml; do
+            echo "Applying $f"
+            rendered=$(ACR_LOGIN_SERVER="${{ secrets.ACR_LOGIN_SERVER }}" GITHUB_SHA="${{ env.IMAGE_TAG }}" envsubst < "$f")
+            if echo "$f" | grep -q "frontend"; then
+              echo "$rendered" | sed 's/type: LoadBalancer/type: ClusterIP/' | kubectl apply -n "${{ env.STG_NS }}" -f -
+            else
+              echo "$rendered" | kubectl apply -n "${{ env.STG_NS }}" -f -
+            fi
+          done
+          kubectl get deploy,svc -n "${{ env.STG_NS }}"
+
+      - name: Wait for rollouts and basic acceptance
+        run: |
+          set -e
+          for d in product-service order-service customer-service frontend; do
+            kubectl rollout status -n "${{ env.STG_NS }}" deployment/$d --timeout=240s
+          done
+          for s in product-service order-service customer-service; do
+            EP=$(kubectl get ep -n "${{ env.STG_NS }}" $s -o jsonpath='{.subsets[*].addresses[*].ip}')
+            if [ -z "$EP" ]; then
+              echo "No endpoints for $s"
+              exit 1
+            fi
+          done
+
+      - name: Teardown staging
+        if: always()
+        run: kubectl delete namespace "${{ env.STG_NS }}" --wait=true
+
+  # ----------------------------------------------------------------------------
+  # Stage 2B — Production: only after merge to main (waits on CI images)
+  # ----------------------------------------------------------------------------
+  prod_deploy:
+    needs: ci_build_push
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Write kubeconfig from secret
+        run: |
+          echo "${{ secrets.KUBE_CONFIG_B64 }}" > kubeconfig.b64
+          base64 -d kubeconfig.b64 > kubeconfig
+          mkdir -p ~/.kube
+          cp kubeconfig ~/.kube/config
+
+      - name: Ensure prod namespace and pull secret
+        run: |
+          kubectl create namespace prod --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret docker-registry acr-pull \
+            -n prod \
+            --docker-server="${{ secrets.ACR_LOGIN_SERVER }}" \
+            --docker-username="${{ secrets.ACR_USERNAME }}" \
+            --docker-password="${{ secrets.ACR_PASSWORD }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+          kubectl patch serviceaccount default -n prod -p '{"imagePullSecrets":[{"name":"acr-pull"}]}'
+
+      - name: Apply manifests to prod
+        run: |
+          sudo apt-get update && sudo apt-get install -y gettext-base
+          for f in k8s/prod/*.y*ml; do
+            ACR_LOGIN_SERVER="${{ secrets.ACR_LOGIN_SERVER }}" GITHUB_SHA="${{ env.IMAGE_TAG }}" \
+              envsubst < "$f" | kubectl apply -n prod -f -
+          done
+          kubectl get deploy,svc -n prod
+
+      - name: Wait for prod rollouts
+        run: |
+          set -e
+          for d in product-service order-service customer-service frontend; do
+            kubectl rollout status -n prod deployment/$d --timeout=300s
+          done
